@@ -1,0 +1,214 @@
+Notes on RAMS update to HDF5 1.10, from Sean Freeman
+5/14/19:
+I tried to compile hdf5 1.10 yesterday using the MPICH library available in RAMS but failed as the mpicc is not actually properly configured. Instead, I downloaded MPICH 3.3 and compiled it properly with icc and ifort. 
+I then compiled hdf5 1.10 with the new mpich successfully.
+
+This isn't viable for long-term use with RAMS- before I send to Steve I want to compile with ifort with the appropriate options as is done in RAMS rather than relying on mpicc. 
+
+For mpich, I did not use a specific compile script; just set the FC, CC, and c++ variables to be the intel compiler. For HDF5 I used config_opts.sh in that directory. 
+
+Make check worked for hdf5 1.10, which is a good sign.
+
+After compiling/linking hdf5 with the new RAMS version, I get the following error when trying to write files: 
+
+HDF5-DIAG: Error detected in HDF5 (1.10.5) MPI-process 0:
+  #000: H5D.c line 119 in H5Dcreate2(): not a location ID
+    major: Invalid arguments to routine
+    minor: Inappropriate type
+  #001: H5Gloc.c line 246 in H5G_loc(): invalid object ID
+    major: Invalid arguments to routine
+    minor: Bad value
+ In shdf5_orec: hdf5 write error =          -1
+shdf5_orec: hdf5 write error
+
+
+Helpful websites from HDF5 on the differences between hdf5 1.10 and 1.8:
+https://support.hdfgroup.org/HDF5/doc/ADGuide/Compatibility_Report/CR_1.10.0.html
+https://support.hdfgroup.org/HDF5/doc/ADGuide/Changes.html
+
+Key difference appears to be switching from 32 to 64 bit integers for everything.   
+
+The HDF group recommends using the "hid_t" type for all interactions with the HDF5 library as it will use 32 bit where appropriate and 64 bit where appropriate, but this isn't possible for us. Because we use fortran calling c for our HDF5 linking (which we should continue to do!), we would have to bring in the hdf5 library into fortran to do this. To avoid this, I'm going to attempt to simply cast the passed in integers to the hid_t type in the c code.
+
+This actually compiled, but upon further thought I've decided that that's not going to work. In the edge case where we get returned a file id that is >int32 length, it will break. Not ideal!
+
+The solution that I am going to try is to switch the fileid handles to INTEGER*8 in the fortran code, switching the C code to hid_t. If it's 1.8, the HDF5 fileid field is a int32, which INTEGER*8 (an int64) can collapse down to. Going the other way is more difficult. 
+
+Code crashes on this revision (commit d32bda5), plus I get warning messages on compilation that hid_t doesn't match integer*8 (I think this is ok as this is deliberate). Crashes with the same error as noted before. It would be nice to get line numbers as I don't think if we got an error this is where we should be getting it. Trying to compile with -g for the c code and the fortran code now. 
+
+5/15/19:
+Trying to use gdb to identify where the failure is. Starting a breakpoint in the hdf5 file write routine in the hdf5_f2c.c. Had to turn off optimization of the C code to do the debugging; trying to compile with no optimization. 
+
+As an aside, we can't compile multithreaded. This indicates that there is a problem with the makefile and dependencies are not properly stated. 
+
+I think I found the bug. When passing from Fortran->C, the fileid isn't actually passed. I need to figure out why this is- it should pass the file ID fine. 
+
+The problem comes about because the functions that do the reading and writing (i.e. mksfc_top.f90 and the rest) save the hdf5 file id and need to be switched to int*8 too. I'm trying this out on the topo dataset to see if we get any further. I think I should also try compiling against hdf5 1.8 soon too to make sure my changes don't break things. 
+
+OK, so what I have done in the hdf5_f2c.c code is that I expect function args in int64_t (which should be equivalent to fortran INTEGER*8). I then cast the int64_t to hid_t, which should work for both 32 and 64 bit hid_t. Then I convert back on the functions that return the file ID. 
+
+My test with the updated hdf5_f2c.c code worked for the topography files. Now to change all hdf5 file IDs in the code to be INTEGER*8s. 
+
+Question- where does everything in the /block/ directory come from? What does it do? Do I need to update this too? 
+Partial answer: It looks like all the file handles in there live in the C space and are of hid_t type, so no!
+
+A reminder to future me to check the warnings- this time because I have rectified the arguments, the warnings saying that the data type doesn't match were relevant.
+
+I got it to work for serial in commit 34c3811, but when I attempted to run in parallel I got a large number of errors.
+
+Actually, it looks like the errors are only when trying to run on different machines. When running on 2 cores on the head node, it works fine. 
+
+5/16/19
+
+Trying to resolve the issue of parallel writes across multiple nodes that I identified yesterday. Steve recommended trying to run on another machine; I will try running on Ice today to confirm the issue. First, trying to narrow down the issue on Frost to find failure/success conditions. Below is the trial and success notes:
+
+Frost:
+1 core on head node: works
+8 cores on frost1: works
+8 cores on frost1/1 on frost2: fails
+4 cores on frost1/4 on frost2: fails
+2 cores on frost1/2 on frost2: works
+3 cores on frost1/3 on frost2: works
+
+Ice:
+1 core on head node: works
+8 cores on ice1: works
+8 cores on ice1/1 on ice2: fails
+
+
+Ok, so I'm pretty convinced that this isn't a machine issue. Googling hasn't turned up much, but I did find the following links that suggest that it may be a chunking issue:
+http://hdf-forum.184993.n3.nabble.com/Errors-when-creating-dataset-when-dataspace-has-a-max-dimension-of-H5S-UNLIMITED-td2900828.html
+http://hdf-forum.184993.n3.nabble.com/Storing-a-large-number-of-floating-point-numbers-that-evolves-over-time-td4029698.html
+
+I've added many debug messages here and seem to have trouble figuring out the issue still. It's definitely etherial...
+
+Is the problem with my specific version of MPI? Maybe. 
+
+I remembered a discussion in the HDF5 install docs saying to do something specific when compiling MPICH; will try to recompile the stack for this. 
+
+
+5/17/19
+Recompiling does nothing. I'm close to out of ideas here. 
+
+Current ideas:
+bug in this version of mpich?
+Some issue with the new 64bit fileid handles being passed around that MPI has an issue with
+Try to pull onto Pleiades, compile there?
+
+5/20/19
+Trying to compile new hdf5 with mpich2 1.5. Maybe there is a bug/incompatibility with hdf5 and that version of mpich?
+
+Pleiades doesn't have hdf5 1.10 available, but I could have sworn it used to be there; maybe they removed it?
+
+ok, I recompiled with mpich2 1.5 and it still didn't work and failed at the same point as usual with the same error.
+
+Ideas:
+Bug in this version of hdf5 1.10? Maybe try 1.10.2 or 1.10.3?
+
+OK, looks like we are getting somewhere. This is the new error:
+HDF5-DIAG: Error detected in HDF5 (1.10.5) MPI-process 3:
+  #000: H5D.c line 145 in H5Dcreate2(): unable to create dataset
+    major: Dataset
+    minor: Unable to initialize object
+  #001: H5Dint.c line 329 in H5D__create_named(): unable to create and link to dataset
+    major: Dataset
+    minor: Unable to initialize object
+  #002: H5L.c line 1557 in H5L_link_object(): unable to create new link to object
+    major: Links
+    minor: Unable to initialize object
+  #003: H5L.c line 1798 in H5L__create_real(): can't insert link
+    major: Links
+    minor: Unable to insert object
+  #004: H5Gtraverse.c line 851 in H5G_traverse(): internal path traversal failed
+    major: Symbol table
+    minor: Object not found
+  #005: H5Gtraverse.c line 627 in H5G__traverse_real(): traversal operator failed
+    major: Symbol table
+    minor: Callback failed
+  #006: H5L.c line 1604 in H5L__link_cb(): unable to create object
+    major: Links
+    minor: Unable to initialize object
+  #007: H5Oint.c line 2453 in H5O_obj_create(): unable to open object
+    major: Object header
+    minor: Can't open object
+  #008: H5Doh.c line 300 in H5O__dset_create(): unable to create dataset
+    major: Dataset
+    minor: Unable to initialize object
+  #009: H5Dint.c line 1278 in H5D__create(): can't update the metadata cache
+    major: Dataset
+    minor: Unable to initialize object
+  #010: H5Dint.c line 977 in H5D__update_oh_info(): unable to update layout/pline/efl header message
+    major: Dataset
+    minor: Unable to initialize object
+  #011: H5Dlayout.c line 508 in H5D__layout_oh_create(): unable to initialize storage
+    major: Dataset
+    minor: Unable to initialize object
+  #012: H5Dint.c line 2335 in H5D__alloc_storage(): unable to initialize dataset with fill value
+    major: Dataset
+    minor: Unable to initialize object
+  #013: H5Dint.c line 2422 in H5D__init_storage(): unable to allocate all chunks of dataset
+    major: Dataset
+    minor: Unable to initialize object
+  #014: H5Dchunk.c line 4402 in H5D__chunk_allocate(): unable to write raw data to file
+    major: Low-level I/O
+    minor: Write failed
+  #015: H5Dchunk.c line 4727 in H5D__chunk_collective_fill(): unable to write raw data to file
+    major: Low-level I/O
+    minor: Write failed
+  #016: H5Fio.c line 165 in H5F_block_write(): write through page buffer failed
+    major: Low-level I/O
+    minor: Write failed
+  #017: H5PB.c line 1028 in H5PB_write(): write through metadata accumulator failed
+    major: Page Buffering
+    minor: Write failed
+  #018: H5Faccum.c line 826 in H5F__accum_write(): file write failed
+    major: Low-level I/O
+    minor: Write failed
+  #019: H5FDint.c line 258 in H5FD_write(): driver write request failed
+    major: Virtual File Layer
+    minor: Write failed
+  #020: H5FDmpio.c line 1834 in H5FD_mpio_write(): MPI_File_write_at_all failed
+    major: Internal error (too specific to document in detail)
+    minor: Some MPI function failed
+  #021: H5FDmpio.c line 1834 in H5FD_mpio_write(): Other I/O error , error stack:
+ADIOI_NFS_WRITESTRIDED(671): Other I/O error Input/output error
+    major: Internal error (too specific to document in detail)
+    minor: MPI Error String
+
+Another new error when enabling parallel:
+
+HDF5-DIAG: Error detected in HDF5 (1.10.5) MPI-process 4:
+  #000: H5Dio.c line 336 in H5Dwrite(): can't write data
+    major: Dataset
+    minor: Write failed
+  #001: H5Dio.c line 813 in H5D__write(): unable to adjust I/O info for parallel I/O
+    major: Dataset
+    minor: Unable to initialize object
+  #002: H5Dio.c line 1226 in H5D__ioinfo_adjust(): Can't perform independent write with filters in pipeline.
+    The following caused a break from collective I/O:
+        Local causes: parallel writes to filtered datasets are disabled
+        Global causes: parallel writes to filtered datasets are disabled
+    major: Low-level I/O
+    minor: Can't perform independent IO
+HDF5-DIAG: Error detected in HDF5 (1.10.5) MPI-process 0:
+
+AH, ok- big clarity moment. Parallel compression will only work with MPI-3, which means MPICH>3. OK, so need to go back to HDF5 and MPICH3. 
+
+5/21/19:
+Errors seem to reside in the chunking operation. Is this a bug in HDF5? Maybe?
+
+Ideas from Steve: 
+Compile with HDF5 1.8.x with new version of MPICH to see what's going on. 
+Compile on NASA Pleiades with HDF5 1.10.x to see what happens
+
+It compiles and runs on Pleiades with HDF5 1.10.5 and their SGI MPT just fine. HDF5 1.8.18 fails with MPICH 3.3 on our machines.
+Error on our machines is definitely MPI related.
+
+5/22/19:
+Trying to compile HDF5 1.10.5 on frost with MPICH 3.3 with --enable-shared. Next step is to compile --with-device=ch3:sock. 
+
+--enable-shared did not fix things, but I want to leave it on. Next trying to compile with sock. 
+
+5/23/19:
+
+OK, so HDF5 1.10.5 compiles and runs RAMS fine on Pleiades but parallel compression still crashes. 
